@@ -31,6 +31,62 @@
     const queuePrevious = get('queue-previous'), queueNext = get('queue-next');
     const controller = new AbortController();
     const on = (element, event, callback) => element.addEventListener(event, callback, { signal: controller.signal });
+    const codeDialog = get('code-dialog'), codeContent = get('code-content');
+    let expandedCode = null;
+    const setCodeExpanded = (button, expanded) => {
+        const label = expanded ? 'Свернуть' : 'На весь экран';
+        button.innerHTML = window.ESDocIcons.svg(expanded ? 'minimize-2' : 'maximize-2', 18);
+        button.title = label;
+        button.setAttribute('aria-label', label);
+        button.setAttribute('aria-expanded', String(expanded));
+    };
+    const restoreCode = () => {
+        if (!expandedCode) return;
+        const { frame, pre, button, position, animation } = expandedCode;
+        expandedCode = null;
+        animation?.cancel();
+        const top = pre.scrollTop, left = pre.scrollLeft;
+        position.replaceWith(frame);
+        pre.scrollTop = top;
+        pre.scrollLeft = left;
+        setCodeExpanded(button, false);
+    };
+    const animateCode = (from, to, duration, finish = () => {}) => {
+        const state = expandedCode;
+        state.animation?.cancel();
+        if (!state.frame.animate) { finish(); return; }
+        const base = state.frame.getBoundingClientRect();
+        const transform = rect => `translate(${rect.left - base.left}px, ${rect.top - base.top}px) scale(${rect.width / base.width}, ${rect.height / base.height})`;
+        const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        const animation = state.frame.animate(reduced
+            ? [{ opacity: 0.8 }, { opacity: 1 }]
+            : [{ transform: transform(from) }, { transform: transform(to) }],
+        { duration: reduced ? 80 : duration, easing: 'cubic-bezier(0.16, 1, 0.3, 1)', fill: 'both' });
+        state.animation = animation;
+        animation.finished.then(() => {
+            if (expandedCode !== state || state.animation !== animation) return;
+            animation.cancel();
+            state.animation = null;
+            finish();
+        }).catch(() => {}); // A new transition or cleanup cancels the old one.
+    };
+    const closeCode = (animate = true) => {
+        if (animate && expandedCode) {
+            if (expandedCode.closing) return;
+            expandedCode.closing = true;
+            animateCode(expandedCode.frame.getBoundingClientRect(), expandedCode.position.getBoundingClientRect(), 180, () => closeCode(false));
+            return;
+        }
+        const button = expandedCode?.button;
+        restoreCode();
+        if (codeDialog.open) codeDialog.close();
+        button?.focus({ preventScroll: true });
+    };
+    on(codeDialog, 'cancel', event => {
+        event.preventDefault();
+        closeCode();
+    });
+    on(codeDialog, 'close', restoreCode);
     const modeFiles = { pack: new Map(), unpack: new Map() };
     let files = modeFiles[mode];
     const rows = new Map();
@@ -41,6 +97,7 @@
     const outputs = [];
     let browseEntries = [], browseFolder = '', browseRequest = 0, previewUrl = null;
     let catalogEntries = [], catalogFiles = [], catalogRequest = 0, selectedEntry = null;
+    let selectedAudioEntries = [];
     let task = '', exportReady = false, catalogSubmitted = false, previewFont = null, clearOnDownload = false;
     let packDownloadStarted = false, exportFinished = false;
     let operation = 0;
@@ -75,7 +132,17 @@
         exportStatus.textContent = 'Скачивание запущено.';
         exportStatus.classList.remove('is-error');
     };
+    const releasePreview = () => {
+        if (previewUrl) {
+            window.ESDocPlayer?.stopLocal(previewUrl);
+            URL.revokeObjectURL(previewUrl);
+        }
+        if (previewFont) document.fonts.delete(previewFont);
+        previewFont = null;
+        previewUrl = null;
+    };
     const clearResult = () => {
+        closeCode(false);
         exportFinished = false;
         if (exportDialog.open) exportDialog.close();
         task = '';
@@ -90,15 +157,13 @@
         pendingPreviewKey = '';
         catalogRequest++;
         browseRequest++;
-        if (previewUrl) URL.revokeObjectURL(previewUrl);
-        if (previewFont) document.fonts.delete(previewFont);
-        previewFont = null;
-        previewUrl = null;
+        releasePreview();
         browseEntries = [];
         catalogEntries = [];
         catalogFiles = [];
         catalogSubmitted = false;
         selectedEntry = null;
+        selectedAudioEntries = [];
         exportReady = false;
         clearOnDownload = false;
         if (mode !== 'pack') browseFolder = '';
@@ -466,11 +531,14 @@
         if (files.size) loadCatalog();
         else say(mode === 'pack' ? 'Добавьте файлы для нового RPA-архива.' : 'Добавьте архивы или скомпилированные скрипты.');
     });
-    const readBrowse = entry => {
+    const audioTypes = { ogg: 'audio/ogg', mp3: 'audio/mpeg', wav: 'audio/wav', opus: 'audio/ogg', flac: 'audio/flac' };
+    const extensionOf = path => path.split('.').pop().toLowerCase();
+    const readBrowse = (entry, audioEntries = selectedEntry === entry ? selectedAudioEntries : []) => {
         if (busy) return;
         retryAvailable = false;
         say('');
         selectedEntry = entry;
+        selectedAudioEntries = audioEntries;
         const previewOptions = options();
         const cacheKey = JSON.stringify([entry.id, previewOptions]);
         for (const button of browserList.querySelectorAll('[data-entry-id]')) {
@@ -503,10 +571,7 @@
         pending.textContent = /\.(rpyc|rpymc|pyc)$/i.test(entry.path) ? 'Декомпилируем файл…' : 'Открываем файл…';
         previewPending.appendChild(pending);
         browserPreview.appendChild(previewPending);
-        if (previewUrl) URL.revokeObjectURL(previewUrl);
-        if (previewFont) document.fonts.delete(previewFont);
-        previewFont = null;
-        previewUrl = null;
+        releasePreview();
         browserStatus.textContent = '';
         updateControls();
         try {
@@ -577,6 +642,7 @@
         };
         const folderNames = [...folders].sort((a, b) => a.localeCompare(b, 'ru'));
         if (mode === 'pack') entries.sort((a, b) => a.path.localeCompare(b.path, 'ru'));
+        const audioEntries = entries.filter(entry => Object.hasOwn(audioTypes, extensionOf(entry.path)));
         queueMatches = folderNames.length + entries.length;
         const pageSize = mode === 'pack' ? queuePageSize : 500;
         queuePage = Math.min(queuePage, Math.max(0, Math.ceil(queueMatches / pageSize) - 1));
@@ -623,7 +689,7 @@
             const kind = /\.(rpyc|rpymc|pyc|rpy|rpym|py|js|json|css|txt)$/i.test(entry.path) ? 'code'
                 : /\.(png|jpg|jpeg|gif|webp|svg)$/i.test(entry.path) ? 'image'
                 : /\.(ogg|mp3|wav|opus|flac|mp4|webm)$/i.test(entry.path) ? 'media' : 'file';
-            row(query ? entry.path : entry.path.slice(browseFolder.length), size(entry.size), () => readBrowse(entry), kind,
+            row(query ? entry.path : entry.path.slice(browseFolder.length), size(entry.size), () => readBrowse(entry, audioEntries), kind,
                 selectedEntry?.id === entry.id, entry.id);
             if (mode === 'pack' || catalogFiles[entry.source]?.path === entry.path && !isArchive(catalogFiles[entry.source]) && files.has(entry.path)) {
                 addRemove([mode === 'pack' ? entry.originalPath : entry.path], 'Убрать ' + entry.path, 'Убрать файл');
@@ -699,13 +765,11 @@
         }
     };
     const showPreview = data => {
-        if (previewUrl) URL.revokeObjectURL(previewUrl);
-        if (previewFont) document.fonts.delete(previewFont);
-        previewFont = null;
+        releasePreview();
         const path = data.name;
-        const extension = path.split('.').pop().toLowerCase();
+        const extension = extensionOf(path);
         const mime = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif',
-            svg: 'image/svg+xml', ogg: 'audio/ogg', mp3: 'audio/mpeg', wav: 'audio/wav', opus: 'audio/ogg', flac: 'audio/flac',
+            svg: 'image/svg+xml', ...audioTypes,
             mp4: 'video/mp4', webm: 'video/webm', ttf: 'font/ttf', otf: 'font/otf', woff: 'font/woff', woff2: 'font/woff2' }[extension] || 'application/octet-stream';
         previewUrl = URL.createObjectURL(data.file || new Blob([data.buffer], { type: mime }));
         browserPreview.replaceChildren();
@@ -731,8 +795,8 @@
             img.src = previewUrl;
             img.alt = path;
             browserPreview.appendChild(img);
-        } else if (mime.startsWith('audio/') || mime.startsWith('video/')) {
-            const media = document.createElement(mime.startsWith('audio/') ? 'audio' : 'video');
+        } else if (mime.startsWith('video/')) {
+            const media = document.createElement('video');
             media.controls = true;
             media.preload = 'metadata';
             media.src = previewUrl;
@@ -769,9 +833,14 @@
             copy.title = 'Скопировать код';
             copy.setAttribute('aria-label', 'Скопировать код');
             // Same copy/check icons and shared CSS as fenced code blocks.
-            copy.innerHTML = window.ESDocIcons.svg('copy', 14) + window.ESDocIcons.svg('check', 14);
+            copy.innerHTML = window.ESDocIcons.svg('copy', 18) + window.ESDocIcons.svg('check', 18);
             const frame = document.createElement('div');
             frame.className = 'code-block code-block--numbered tools-code-frame';
+            const toolbar = document.createElement('div');
+            toolbar.className = 'tools-code-toolbar';
+            const actions = document.createElement('div');
+            actions.className = 'tools-code-actions';
+            toolbar.append(heading, actions);
             const pre = document.createElement('pre');
             pre.tabIndex = 0;
             pre.setAttribute('aria-label', 'Код файла');
@@ -782,13 +851,12 @@
             gutter.textContent = lines.map((_, i) => String(i + 1)).join('\n');
             const scroll = document.createElement('span');
             scroll.className = 'code-scroll';
-            // Focus the bounded viewport, not its very tall code column:
-            // focusing that column can scroll the panel halfway through a file.
+            // Keep keyboard navigation on the viewport shared by both axes.
             pre.addEventListener('keydown', event => {
                 if (event.target !== pre || event.altKey || event.ctrlKey || event.metaKey) return;
                 if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
                 event.preventDefault();
-                scroll.scrollLeft += event.key === 'ArrowRight' ? 40 : -40;
+                pre.scrollLeft += event.key === 'ArrowRight' ? 40 : -40;
             });
             const code = document.createElement('code');
             // Only HTML escaped by our local Pygments formatter is inserted.
@@ -796,13 +864,37 @@
             else code.textContent = text;
             scroll.appendChild(code);
             pre.append(gutter, scroll);
-            frame.appendChild(pre);
+            frame.append(toolbar, pre);
             if (window.copyControl && window.navigator?.clipboard) {
                 copy.addEventListener('click', window.copyControl(copy, () => text, { message: 'Код скопирован.', status: browserStatus }));
-                frame.appendChild(copy);
+                actions.appendChild(copy);
             }
+            const expand = document.createElement('button');
+            expand.type = 'button';
+            expand.className = 'tools-code-expand';
+            setCodeExpanded(expand, false);
+            expand.setAttribute('aria-haspopup', 'dialog');
+            expand.setAttribute('aria-controls', 'tools-code-dialog');
+            expand.addEventListener('click', () => {
+                if (expandedCode) { closeCode(); return; }
+                const position = document.createElement('span');
+                position.className = 'tools-code-placeholder';
+                const rect = frame.getBoundingClientRect();
+                position.style.height = rect.height + 'px';
+                const top = pre.scrollTop, left = pre.scrollLeft;
+                frame.before(position);
+                expandedCode = { frame, pre, button: expand, position };
+                setCodeExpanded(expand, true);
+                codeContent.appendChild(frame);
+                codeDialog.showModal();
+                pre.scrollTop = top;
+                pre.scrollLeft = left;
+                expand.focus({ preventScroll: true });
+                animateCode(rect, frame.getBoundingClientRect(), 260);
+            });
+            actions.appendChild(expand);
             browserPreview.appendChild(frame);
-        } else {
+        } else if (!mime.startsWith('audio/')) {
             const note = document.createElement('p');
             note.textContent = 'Предпросмотр для этого формата недоступен.';
             browserPreview.appendChild(note);
@@ -815,14 +907,34 @@
         browserPreview.appendChild(link);
         browserPreview.setAttribute('aria-busy', 'false');
         browserStatus.textContent = '';
+        if (mime.startsWith('audio/')) {
+            const queue = selectedAudioEntries;
+            const index = queue.indexOf(selectedEntry);
+            const entryId = selectedEntry?.id;
+            window.ESDocPlayer.playLocal({
+                src: previewUrl,
+                name: path,
+                advance: wrap => {
+                    if (busy || disposed || index < 0) return false;
+                    const next = queue[index + 1] || (wrap ? queue[0] : null);
+                    if (!next) return false;
+                    readBrowse(next, queue);
+                    return true;
+                },
+                onError: () => { browserStatus.textContent = 'Не удалось воспроизвести аудиофайл.'; },
+                restoreFocus: () => {
+                    const row = [...browserList.querySelectorAll('[data-entry-id]')]
+                        .find(button => button.dataset.entryId === entryId);
+                    (row && !row.disabled ? row : link).focus();
+                },
+            });
+        }
     };
     const openBrowse = () => {
         selectedEntry = null;
+        selectedAudioEntries = [];
         browseRequest++;
-        if (previewUrl) URL.revokeObjectURL(previewUrl);
-        if (previewFont) document.fonts.delete(previewFont);
-        previewFont = null;
-        previewUrl = null;
+        releasePreview();
         const source = Number(browseArchive.value) || 0;
         const scripts = browseArchive.value === 'scripts';
         browseEntries = mode === 'pack' ? catalogEntries : catalogEntries.filter(entry => scripts

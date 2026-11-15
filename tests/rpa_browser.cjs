@@ -6,11 +6,26 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { chromium } = require('playwright');
 const root = path.resolve(__dirname, '..');
-const fixtures = path.join(root, 'temp/rpa-tree-browser/game');
+const fixtures = path.join(root, 'temp/rpa-tree-browser-audio/game');
 const target = process.env.RPA_TEST_URL || 'http://127.0.0.1:8012/tools/unpack?mode=pack';
+// Five seconds of silent PCM exercises real browser playback without external assets.
+const wav = Buffer.alloc(44 + 80000);
+wav.write('RIFF');
+wav.writeUInt32LE(wav.length - 8, 4);
+wav.write('WAVEfmt ', 8);
+wav.writeUInt32LE(16, 16);
+wav.writeUInt16LE(1, 20);
+wav.writeUInt16LE(1, 22);
+wav.writeUInt32LE(8000, 24);
+wav.writeUInt32LE(16000, 28);
+wav.writeUInt16LE(2, 32);
+wav.writeUInt16LE(16, 34);
+wav.write('data', 36);
+wav.writeUInt32LE(wav.length - 44, 40);
 const resources = {
     'my_mod/images/bg.png': Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aWQAAAABJRU5ErkJggg==', 'base64'),
-    'my_mod/audio/тема.ogg': Buffer.from([0, 255, 128, 65]),
+    'my_mod/audio/тема.wav': wav,
+    'my_mod/audio/финал.wav': wav,
     'my_mod/empty.txt': Buffer.alloc(0),
     'my_mod/script.rpy': Buffer.from('label my_mod_start:\n    return\n'),
 };
@@ -25,6 +40,15 @@ for (const [name, data] of Object.entries(resources)) {
     try {
         const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, colorScheme: 'light' });
         const page = await context.newPage();
+        await page.addInitScript(() => {
+            const BrowserAudio = window.Audio;
+            window.Audio = class extends BrowserAudio {
+                constructor(...args) {
+                    super(...args);
+                    window.testAudio = this;
+                }
+            };
+        });
         const errors = [], requests = [];
         page.on('pageerror', error => errors.push(error.message));
         context.on('request', request => requests.push([request.method(), request.url()]));
@@ -80,7 +104,7 @@ for (const [name, data] of Object.entries(resources)) {
         assert.equal(saved.suggestedFilename(), 'my_mod.rpa');
         const archive = path.join(root, 'temp/rpa-browser/my_mod.rpa');
         await saved.saveAs(archive);
-        assert.match(await page.locator('#tools-result-description').textContent(), /Файлов в RPA: 4/);
+        assert.match(await page.locator('#tools-result-description').textContent(), /Файлов в RPA: 5/);
         assert(await page.locator('#tools-pack-integration').isVisible());
         assert.match(await page.locator('#tools-pack-install-archive').textContent(), /my_mod\.rpa$/);
         assert(await page.locator('#tools-export-dialog').isVisible());
@@ -127,7 +151,7 @@ for (const [name, data] of Object.entries(resources)) {
             'for name, records in index.items():',
             '    content = b"".join(data[start ^ key:(start ^ key) + (length ^ key)] for start, length in records)',
             '    assert content == (pathlib.Path(sys.argv[2]) / name).read_bytes(), name',
-            'assert len(index) == 4',
+            'assert len(index) == 5',
         ].join('\n'), archive, fixtures]);
         await page.locator('#tools-browser-search').fill('script.rpy');
         await page.locator('#tools-browser-list button[data-entry-id]').click();
@@ -149,8 +173,62 @@ for (const [name, data] of Object.entries(resources)) {
         assert.deepEqual(await page.locator('#tools-browser-list button[data-entry-id]').allTextContents(), verifiedPaths);
         await page.locator('#tools-mode-unpack').check();
         await page.locator('#tools-browser-list button').first().waitFor({ state: 'visible', timeout: 90000 });
-        await page.locator('#tools-browser-search').fill('тема');
-        assert.match(await page.locator('#tools-browser-list').textContent(), /тема.ogg/);
+        const tracks = page.locator('#tools-browser-list button[data-entry-id]');
+        await page.locator('#tools-browser-search').fill('.wav');
+        const trackNames = await tracks.allTextContents();
+        assert.equal(trackNames.length, 2);
+        await tracks.first().click();
+        const player = page.locator('.res-nowplaying--visible');
+        await player.waitFor({ timeout: 5000 });
+        const playing = name => page.waitForFunction(name => !window.testAudio.paused
+            && window.testAudio.currentTime > 0
+            && document.querySelector('.res-nowplaying-name').textContent === name, name);
+        await playing(trackNames[0]);
+        assert.equal(await player.locator('.res-volume input').evaluate(el => el.style.getPropertyValue('--range-pct')), '100%');
+        assert(!await page.evaluate(() => sessionStorage.getItem('es-doc-player-v2')));
+        const repeat = player.locator('.res-nowplaying-repeat');
+        const nearEnd = () => page.evaluate(() => { window.testAudio.currentTime = window.testAudio.duration - 0.1; });
+        await repeat.click();
+        assert.equal(await repeat.getAttribute('aria-label'), 'Повтор трека');
+        assert(await page.evaluate(() => window.testAudio.loop));
+        const firstSrc = await page.evaluate(() => window.testAudio.src);
+        await nearEnd();
+        await page.waitForFunction(src => window.testAudio.src === src && !window.testAudio.paused
+            && window.testAudio.currentTime < 1, firstSrc);
+        await repeat.click();
+        assert.equal(await repeat.getAttribute('aria-label'), 'Повтор очереди');
+        await nearEnd();
+        await playing(trackNames[1]);
+        await nearEnd();
+        await playing(trackNames[0]);
+        await repeat.click();
+        assert.equal(await repeat.getAttribute('aria-label'), 'Повтор выключен');
+        await nearEnd();
+        await playing(trackNames[1]);
+        await nearEnd();
+        await page.locator('.res-nowplaying--ended').waitFor();
+        for (const [width, theme] of [[1440, 'light'], [390, 'dark']]) {
+            await page.setViewportSize({ width, height: 1000 });
+            await page.evaluate(theme => document.documentElement.dataset.theme = theme, theme);
+            assert(await player.evaluate(bar => [...bar.querySelectorAll('button, input')].every(control => {
+                const bounds = bar.getBoundingClientRect(), rect = control.getBoundingClientRect();
+                return rect.width >= 24 && rect.left >= bounds.left && rect.right <= bounds.right;
+            })));
+            await player.screenshot({ path: path.join(downloadReview, 'audio-player-' + theme + '.png') });
+        }
+        await page.setViewportSize({ width: 1440, height: 1000 });
+        await page.evaluate(() => document.documentElement.dataset.theme = 'light');
+        await tracks.first().click();
+        await playing(trackNames[0]);
+        await player.getByRole('button', { name: 'Остановить' }).click();
+        assert(await tracks.first().evaluate(el => el === document.activeElement));
+        await tracks.first().click();
+        await playing(trackNames[0]);
+        await page.locator('#tools-browser-search').fill('.png');
+        await tracks.first().click();
+        await player.waitFor({ state: 'hidden' });
+        assert(await page.evaluate(() => window.testAudio.paused && !window.testAudio.hasAttribute('src')));
+        await page.locator('#tools-browser-preview img').waitFor();
         const extracted = page.waitForEvent('download', { timeout: 90000 });
         await page.locator('#tools-export-start').click();
         const zip = await extracted;
@@ -175,7 +253,7 @@ for (const [name, data] of Object.entries(resources)) {
             'with zipfile.ZipFile(sys.argv[1]) as archive:',
             '    for name in archive.namelist():',
             '        assert archive.read(name) == (pathlib.Path(sys.argv[2]) / name).read_bytes(), name',
-            '    assert len(archive.namelist()) == 4',
+            '    assert len(archive.namelist()) == 5',
         ].join('\n'), zipPath, fixtures]);
         assert.deepEqual(errors, []);
 
@@ -207,7 +285,7 @@ for (const [name, data] of Object.entries(resources)) {
         const removeImages = page.getByRole('button', { name: 'Убрать папку my_mod/images/ и все вложенные файлы', exact: true });
         await removeImages.focus();
         await page.keyboard.press('Enter');
-        assert.match(await page.locator('#tools-count').textContent(), /3 файла/);
+        assert.match(await page.locator('#tools-count').textContent(), /4 файла/);
         assert.equal(await page.locator('#tools-browser-list button').filter({hasText: 'images/'}).count(), 0);
         assert.equal(await page.locator('#tools-browser-list button').filter({hasText: 'audio/'}).count(), 1);
         assert(await page.locator('#tools-browser-list .tools-remove-source').nth(1).evaluate(el => el === document.activeElement));
@@ -269,6 +347,6 @@ for (const [name, data] of Object.entries(resources)) {
             assert(contrasts.every(({ ratio }) => ratio >= 3), JSON.stringify({ name, contrasts }));
             await page.screenshot({ path: path.join(review, name + '.png'), fullPage: true });
         }
-        console.log('Browser RPA creation, cancellation, extraction, byte comparison, local GET-only processing and responsive checks passed.');
+        console.log('Browser RPA creation, extraction, audio playback, repeat, cancellation, byte comparison, local GET-only processing and responsive checks passed.');
     } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });
