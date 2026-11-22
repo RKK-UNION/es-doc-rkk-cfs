@@ -44,6 +44,8 @@
     let current = null;
     let currentSrc = '';
     let currentName = '';
+    let localTrack = null;
+    let localRepeat = 'off';
     let resumeTime = 0;
     let finished = false;
 
@@ -96,15 +98,19 @@
             (button.dataset.playLabel || `Прослушать ${button.dataset.playName || 'аудиофайл'}`));
     };
 
-    const setRepeat = enabled => {
-        audio.loop = enabled;
+    const repeatLabels = { off: 'Повтор выключен', track: 'Повтор трека', queue: 'Повтор очереди' };
+    const setRepeat = mode => {
+        const enabled = mode !== 'off';
+        audio.loop = mode === 'track';
         repeat.setAttribute('aria-pressed', enabled ? 'true' : 'false');
-        repeat.setAttribute('aria-label', enabled ? 'Повтор включён' : 'Повтор выключен');
-        repeat.title = enabled ? 'Выключить повтор' : 'Повторить произведение';
+        const label = localTrack ? repeatLabels[mode] : enabled ? 'Повтор включён' : repeatLabels.off;
+        repeat.setAttribute('aria-label', label);
+        repeat.title = localTrack ? label : enabled ? 'Выключить повтор' : 'Повторить произведение';
+        repeat.innerHTML = window.ESDocIcons.svg(localTrack && mode === 'track' ? 'repeat-1' : 'repeat', 18);
     };
 
     const persist = (playing = !audio.paused, time = audio.currentTime) => {
-        if (!currentSrc) return;
+        if (!currentSrc || localTrack) return;
         writePlayerState(playerStorage, {
             src: currentSrc,
             name: currentName,
@@ -165,19 +171,26 @@
     barVolume.addEventListener('input', () => setVolume(parseFloat(barVolume.value)));
 
     const stop = () => {
-        audio.pause();
         if (current && bar.contains(document.activeElement)) current.focus();
-        bar.classList.remove('res-nowplaying--visible', 'res-nowplaying--ended');
+        bar.classList.remove('res-nowplaying--visible', 'res-nowplaying--ended', 'res-nowplaying--local');
         setButtonState(current, false);
         current = null;
         currentSrc = '';
         currentName = '';
+        resumeTime = 0;
         finished = false;
+        audio.pause();
+        if (localTrack) {
+            localTrack = null;
+            audio.removeAttribute('src');
+            audio.load();
+        }
         clearPlayerState(playerStorage);
     };
 
     const finish = () => {
-        if (audio.loop) return;
+        if (!currentSrc || audio.loop) return;
+        if (localTrack?.advance(localRepeat === 'queue')) return;
         finished = true;
         audio.currentTime = 0;
         setButtonState(current, false);
@@ -189,24 +202,38 @@
     };
 
     audio.addEventListener('ended', finish);
-    audio.addEventListener('error', stop);
-    bar.querySelector('.res-nowplaying-stop').addEventListener('click', stop);
+    audio.addEventListener('error', () => {
+        if (!audio.error) return;
+        localTrack?.onError();
+        stop();
+    });
+    bar.querySelector('.res-nowplaying-stop').addEventListener('click', () => {
+        if (bar.contains(document.activeElement)) localTrack?.restoreFocus();
+        stop();
+    });
 
-    pause.addEventListener('click', () => {
+    const togglePlayback = () => {
         if (audio.paused) {
             if (finished) { audio.currentTime = 0; finished = false; }
             audio.play().catch(() => {});
         } else {
             audio.pause();
         }
-    });
+    };
+    pause.addEventListener('click', togglePlayback);
 
     repeat.addEventListener('click', () => {
-        setRepeat(!audio.loop);
+        if (localTrack) {
+            localRepeat = { off: 'track', track: 'queue', queue: 'off' }[localRepeat];
+            setRepeat(localRepeat);
+        } else {
+            setRepeat(audio.loop ? 'off' : 'track');
+        }
         persist(!audio.paused);
     });
 
     audio.addEventListener('pause', () => {
+        if (!currentSrc || !audio.paused) return;
         bar.classList.add('res-nowplaying--paused');
         pause.setAttribute('aria-label', 'Продолжить');
         setButtonState(current, false);
@@ -215,6 +242,7 @@
     });
 
     audio.addEventListener('play', () => {
+        if (!currentSrc || audio.paused) return;
         finished = false;
         bar.classList.remove('res-nowplaying--paused', 'res-nowplaying--ended');
         pause.setAttribute('aria-label', 'Пауза');
@@ -222,6 +250,38 @@
         persist(true);
         status.textContent = 'Воспроизведение: ' + (barName.textContent || '') + '.';
     });
+
+    const startTrack = (src, name, button = null, track = null) => {
+        stop();
+        current = button;
+        currentSrc = src;
+        currentName = name;
+        localTrack = track;
+        barName.textContent = currentName;
+        barName.title = currentName;
+        seek.value = 0;
+        seek.max = 0;
+        setFill(seek);
+        timeNow.textContent = timeAll.textContent = '0:00';
+        setRepeat(track ? localRepeat : 'off');
+        if (track) bar.classList.add('res-nowplaying--local');
+        pause.setAttribute('aria-label', 'Воспроизвести');
+        bar.classList.add('res-nowplaying--visible', 'res-nowplaying--paused');
+        audio.src = currentSrc;
+        audio.play().catch(error => {
+            if (track && localTrack === track && error.name === 'NotAllowedError') {
+                status.textContent = 'Нажмите кнопку воспроизведения в плеере.';
+            }
+        });
+    };
+
+    // Local previews own their object URLs and release them after stopping playback.
+    window.ESDocPlayer = {
+        playLocal: track => startTrack(track.src, track.name, null, track),
+        stopLocal: src => {
+            if (localTrack?.src === src) stop();
+        },
+    };
 
     const bindButtons = () => {
         document.querySelectorAll('[data-player-fallback]').forEach(el => el.remove());
@@ -232,30 +292,11 @@
             button.dataset.playerBound = '1';
             button.hidden = false;
             button.addEventListener('click', () => {
-            if (current === button) {
-                if (audio.paused) {
-                    if (finished) audio.currentTime = 0;
-                    audio.play().catch(() => {});
-                } else {
-                    audio.pause();
+                if (current === button) {
+                    togglePlayback();
+                    return;
                 }
-                return;
-            }
-
-            stop();
-            current = button;
-            currentSrc = button.dataset.playSrc;
-            currentName = button.dataset.playName || '';
-            barName.textContent = currentName;
-            seek.value = 0;
-            seek.max = 0;
-            setFill(seek);
-            timeNow.textContent = timeAll.textContent = '0:00';
-            finished = false;
-            setRepeat(false);
-            bar.classList.add('res-nowplaying--visible');
-            audio.src = currentSrc;
-            audio.play().catch(() => {});
+                startTrack(button.dataset.playSrc, button.dataset.playName || '', button);
             });
         });
     };
@@ -269,7 +310,7 @@
         currentName = saved.name;
         barName.textContent = currentName;
         resumeTime = saved.time;
-        setRepeat(saved.repeat);
+        setRepeat(saved.repeat ? 'track' : 'off');
         bar.classList.add('res-nowplaying--visible');
         audio.src = saved.src;
         if (saved.playing) audio.play().catch(() => persist(false, saved.time));

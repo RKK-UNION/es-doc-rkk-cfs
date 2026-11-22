@@ -67,6 +67,8 @@ function page(search = '', withClipboard = false) {
     menu.children = [get('tools-pick-files'), get('tools-pick-folder')];
     const messages = [], workers = [], revoked = [], blobs = [];
     const window = new Element(); window.location = { search };
+    const played = [];
+    window.ESDocPlayer = { playLocal: track => played.push(track), stopLocal() {} };
     const copied = [];
     if (withClipboard) {
         window.navigator = { clipboard: {} };
@@ -102,7 +104,7 @@ function page(search = '', withClipboard = false) {
         send({ type: 'done', result: total });
     };
     return { get: name => get('tools-' + name), document, archiveRadio, scriptRadio,
-        messages, workers, revoked, blobs, window, send, catalog, add, exportDone, result, copied };
+        messages, workers, revoked, blobs, window, send, catalog, add, exportDone, result, copied, played };
 }
 const script = { id: '0:script.rpyc', path: 'script.rpyc', source: 0, size: 1 };
 
@@ -521,12 +523,12 @@ for (const [name, mime] of [['track.OPUS', 'audio/ogg'], ['track.FLAC', 'audio/f
         ui.send({ type: 'source-file', requestId: ui.messages.at(-1).requestId, name,
             buffer: new Uint8Array([1, 2, 3]).buffer });
         assert.equal(ui.blobs.at(-1).type, mime);
-        const media = ui.get('browser-preview').children[1];
-        assert.equal(media.tagName, 'AUDIO');
-        assert.equal(media.controls, true);
-        assert.equal(media.preload, 'metadata');
-        assert.match(media.src, /^blob:/);
-        assert.equal(ui.get('browser-preview').children[2].download, name);
+        const track = ui.played.at(-1);
+        const download = ui.get('browser-preview').children[1];
+        assert.equal(track.name, name);
+        assert.match(track.src, /^blob:/);
+        assert.equal(download.href, track.src);
+        assert.equal(download.download, name);
         assert.equal(button.children[0].className, 'tools-ui-icon tools-icon-media');
     });
 }
