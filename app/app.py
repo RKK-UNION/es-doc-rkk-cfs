@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request
 from starlette.exceptions import HTTPException
 from starlette.middleware.gzip import GZipMiddleware
+from starlette.responses import PlainTextResponse
 import time
 
 from .routes import main_router
@@ -29,6 +30,20 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         'detail': detail,
         'description': description
     }, status_code=exc.status_code)
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    # nginx handles this internal redirect with its standalone error page.
+    # Keep a safe 500 body for direct ASGI clients and local development.
+    # ServerErrorMiddleware re-raises the exception for the server to log it.
+    return PlainTextResponse(
+        'Internal Server Error',
+        status_code=500,
+        headers={
+            'X-Accel-Redirect': '/_nginx/server-error',
+            'Cache-Control': 'no-store',
+        },
+    )
 
 class LogRequests:
     """Pure ASGI middleware, not `@app.middleware("http")` (BaseHTTPMiddleware):
